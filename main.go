@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +55,7 @@ type Config struct {
 	Timeout             time.Duration
 	HTTPPath            string
 	HTTPScheme          string
+	TCPPorts            []int
 	InsecureSkipVerify  bool
 	PrintVersionAndExit bool
 }
@@ -73,6 +75,7 @@ func loadConfig(args []string) (Config, error) {
 	fs.DurationVar(&c.Timeout, "timeout", getDuration("TIMEOUT", 2*time.Second), "Per-probe timeout")
 	fs.StringVar(&c.HTTPPath, "http-path", getStr("HTTP_PATH", "/"), "HTTP path to probe")
 	fs.StringVar(&c.HTTPScheme, "http-scheme", getStr("HTTP_SCHEME", "http"), "http or https")
+	tcpPortsRaw := fs.String("tcp-ports", getStr("TCP_PORTS", ""), "Comma-separated TCP ports to require after HTTP(S) probe")
 	fs.BoolVar(&c.InsecureSkipVerify, "insecure-skip-verify", getBool("INSECURE_SKIP_VERIFY", false), "skip TLS verification")
 	fs.BoolVar(&c.PrintVersionAndExit, "version", false, "print version and exit")
 
@@ -98,6 +101,11 @@ func loadConfig(args []string) (Config, error) {
 	if len(c.IPs) == 0 {
 		return c, errors.New("--ips (or IPS) is required")
 	}
+	tcpPorts, err := parseTCPPorts(*tcpPortsRaw)
+	if err != nil {
+		return c, err
+	}
+	c.TCPPorts = tcpPorts
 	return c, nil
 }
 
@@ -111,6 +119,7 @@ type Runner struct {
 	urlScheme        string
 	httpPath         string
 	hostHeader       string
+	tcpPorts         []int
 	interval         time.Duration
 	timeout          time.Duration
 }
@@ -179,6 +188,9 @@ func (r *Runner) HealthyIPs(ctx context.Context) ([]string, error) {
 		_ = resp.Body.Close()
 		logger.Info("HTTP response received", "ip", ip, "url", u, "status_code", resp.StatusCode)
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if !r.tcpPortsHealthy(ctx, ip) {
+				continue
+			}
 			healthy = append(healthy, ip)
 			logger.Info("IP marked as healthy", "ip", ip)
 		} else {
@@ -189,6 +201,33 @@ func (r *Runner) HealthyIPs(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("no healthy IP found")
 	}
 	return healthy, nil
+}
+
+func (r *Runner) tcpPortsHealthy(ctx context.Context, ip string) bool {
+	logger := log.FromContext(ctx)
+	for _, port := range r.tcpPorts {
+		address := net.JoinHostPort(ip, strconv.Itoa(port))
+		dialer := net.Dialer{Timeout: r.probeTimeout()}
+		conn, err := dialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			logger.Info("tcp probe failed", "ip", ip, "port", port, "error", err.Error())
+			logger.Info("IP marked as unhealthy due to required TCP port failure", "ip", ip, "port", port)
+			return false
+		}
+		_ = conn.Close()
+		logger.Info("tcp probe succeeded", "ip", ip, "port", port)
+	}
+	return true
+}
+
+func (r *Runner) probeTimeout() time.Duration {
+	if r.timeout > 0 {
+		return r.timeout
+	}
+	if r.httpClient != nil && r.httpClient.Timeout > 0 {
+		return r.httpClient.Timeout
+	}
+	return 0
 }
 
 func portForScheme(s string) string {
@@ -293,6 +332,7 @@ func main() {
 		urlScheme:        cfg.HTTPScheme,
 		httpPath:         cfg.HTTPPath,
 		hostHeader:       cfg.HostHeader,
+		tcpPorts:         cfg.TCPPorts,
 		interval:         cfg.Interval,
 		timeout:          cfg.Timeout,
 	}
@@ -323,6 +363,7 @@ func main() {
 		"interval", r.interval.String(),
 		"scheme", cfg.HTTPScheme,
 		"host_header", cfg.HostHeader,
+		"tcp_ports", intsToCSV(cfg.TCPPorts),
 	)
 	if err := mgr.Start(ctx); err != nil {
 		logger.Error(err, "problem running manager")
@@ -362,6 +403,28 @@ func splitAndTrim(csv string) []string {
 		}
 	}
 	return out
+}
+func intsToCSV(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ",")
+}
+func parseTCPPorts(csv string) ([]int, error) {
+	if strings.TrimSpace(csv) == "" {
+		return nil, nil
+	}
+	parts := splitAndTrim(csv)
+	ports := make([]int, 0, len(parts))
+	for _, part := range parts {
+		port, err := strconv.Atoi(part)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid TCP port %q", part)
+		}
+		ports = append(ports, port)
+	}
+	return ports, nil
 }
 func max(a, b int) int {
 	if a > b {

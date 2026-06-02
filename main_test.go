@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -266,6 +269,120 @@ func TestRunner_HealthyIPs_Timeout(t *testing.T) {
 	}
 }
 
+func TestRunner_HealthyIPs_NoTCPPortsUsesHTTPOnly(t *testing.T) {
+	runner := &Runner{
+		ips: []string{"127.0.0.1", "127.0.0.2"},
+		httpClient: &http.Client{
+			Transport: fakeStatusTransport{
+				statusByIP: map[string]int{
+					"127.0.0.1": 200,
+					"127.0.0.2": 503,
+				},
+			},
+			Timeout: 100 * time.Millisecond,
+		},
+		urlScheme: "http",
+		httpPath:  "/",
+		timeout:   100 * time.Millisecond,
+	}
+
+	healthyIPs, err := runner.HealthyIPs(context.Background())
+	if err != nil {
+		t.Fatalf("HealthyIPs: %v", err)
+	}
+	if !equalStrings(healthyIPs, []string{"127.0.0.1"}) {
+		t.Errorf("healthy IPs = %#v, want %#v", healthyIPs, []string{"127.0.0.1"})
+	}
+}
+
+func TestRunner_HealthyIPs_WithTCPPorts(t *testing.T) {
+	openPort := listenTCPPort(t, "tcp4", "127.0.0.1:0")
+	closedPort := unusedTCPPort(t, "tcp4", "127.0.0.1:0")
+
+	tests := []struct {
+		name            string
+		statusByIP      map[string]int
+		tcpPorts        []int
+		expectedHealthy []string
+		expectError     bool
+	}{
+		{
+			name:            "HTTP healthy and all TCP ports reachable",
+			statusByIP:      map[string]int{"127.0.0.1": 200},
+			tcpPorts:        []int{openPort},
+			expectedHealthy: []string{"127.0.0.1"},
+		},
+		{
+			name:            "HTTP healthy but one TCP port unreachable",
+			statusByIP:      map[string]int{"127.0.0.1": 200},
+			tcpPorts:        []int{openPort, closedPort},
+			expectedHealthy: nil,
+			expectError:     true,
+		},
+		{
+			name:            "HTTP unhealthy even when TCP port reachable",
+			statusByIP:      map[string]int{"127.0.0.1": 503},
+			tcpPorts:        []int{openPort},
+			expectedHealthy: nil,
+			expectError:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &Runner{
+				ips: []string{"127.0.0.1"},
+				httpClient: &http.Client{
+					Transport: fakeStatusTransport{statusByIP: tt.statusByIP},
+					Timeout:   100 * time.Millisecond,
+				},
+				urlScheme: "http",
+				httpPath:  "/",
+				timeout:   100 * time.Millisecond,
+				tcpPorts:  tt.tcpPorts,
+			}
+
+			healthyIPs, err := runner.HealthyIPs(context.Background())
+			if tt.expectError && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.expectError && err != nil {
+				t.Fatalf("HealthyIPs: %v", err)
+			}
+			if !equalStrings(healthyIPs, tt.expectedHealthy) {
+				t.Errorf("healthy IPs = %#v, want %#v", healthyIPs, tt.expectedHealthy)
+			}
+		})
+	}
+}
+
+func TestRunner_HealthyIPs_TCPPortsIPv6(t *testing.T) {
+	openPort, ok := listenTCPPortIfAvailable(t, "tcp6", "[::1]:0")
+	if !ok {
+		t.Skip("IPv6 loopback is not available")
+	}
+
+	runner := &Runner{
+		ips: []string{"::1"},
+		httpClient: &http.Client{
+			Transport: fakeStatusTransport{statusByIP: map[string]int{"::1": 200}},
+			Timeout:   100 * time.Millisecond,
+		},
+		urlScheme: "http",
+		httpPath:  "/",
+		timeout:   100 * time.Millisecond,
+		tcpPorts:  []int{openPort},
+	}
+
+	healthyIPs, err := runner.HealthyIPs(context.Background())
+	if err != nil {
+		t.Fatalf("HealthyIPs: %v", err)
+	}
+	if !equalStrings(healthyIPs, []string{"::1"}) {
+		t.Errorf("healthy IPs = %#v, want %#v", healthyIPs, []string{"::1"})
+	}
+}
+
 func TestPortForScheme(t *testing.T) {
 	tests := []struct {
 		scheme   string
@@ -305,6 +422,84 @@ func TestConfig_GatewayMode(t *testing.T) {
 	}
 	if len(cfg.IPs) != 2 {
 		t.Errorf("IPs len = %d, want 2", len(cfg.IPs))
+	}
+}
+
+func TestConfig_TCPPorts(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		args      []string
+		wantPorts []int
+	}{
+		{
+			name:      "not configured",
+			wantPorts: nil,
+		},
+		{
+			name:      "flag parses comma-separated ports",
+			args:      []string{"--tcp-ports=993,587,25"},
+			wantPorts: []int{993, 587, 25},
+		},
+		{
+			name:      "environment variable parses comma-separated ports",
+			env:       "993,587",
+			wantPorts: []int{993, 587},
+		},
+		{
+			name:      "whitespace and empty entries are ignored",
+			args:      []string{"--tcp-ports= 993, , 587 ,25 "},
+			wantPorts: []int{993, 587, 25},
+		},
+		{
+			name:      "flag overrides environment variable",
+			env:       "25",
+			args:      []string{"--tcp-ports=993"},
+			wantPorts: []int{993},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GATEWAY_NAME", "public-edge")
+			t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
+			t.Setenv("IPS", "1.1.1.1")
+			if tt.env != "" {
+				t.Setenv("TCP_PORTS", tt.env)
+			}
+
+			cfg, err := loadConfig(tt.args)
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if !equalInts(cfg.TCPPorts, tt.wantPorts) {
+				t.Errorf("TCPPorts = %#v, want %#v", cfg.TCPPorts, tt.wantPorts)
+			}
+		})
+	}
+}
+
+func TestConfig_TCPPortsInvalid(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "non-numeric", raw: "993,imap"},
+		{name: "zero", raw: "0"},
+		{name: "negative", raw: "-1"},
+		{name: "too large", raw: "65536"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GATEWAY_NAME", "public-edge")
+			t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
+			t.Setenv("IPS", "1.1.1.1")
+
+			if _, err := loadConfig([]string{"--tcp-ports=" + tt.raw}); err == nil {
+				t.Fatal("expected error for invalid TCP ports, got nil")
+			}
+		})
 	}
 }
 
@@ -405,4 +600,102 @@ func TestRunner_NoopWhenAnnotationAlreadyCorrect(t *testing.T) {
 	if got.ResourceVersion != "1" {
 		t.Errorf("resourceVersion bumped unexpectedly: %s (expected no-op)", got.ResourceVersion)
 	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type fakeStatusTransport struct {
+	statusByIP map[string]int
+}
+
+func (t fakeStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	status, ok := t.statusByIP[req.URL.Hostname()]
+	if !ok {
+		status = http.StatusNotFound
+	}
+	return &http.Response{
+		StatusCode: status,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    req,
+		Header:     make(http.Header),
+	}, nil
+}
+
+func listenTCPPort(t *testing.T, network, address string) int {
+	t.Helper()
+	port, ok := listenTCPPortIfAvailable(t, network, address)
+	if !ok {
+		t.Fatalf("listen %s %s failed", network, address)
+	}
+	return port
+}
+
+func listenTCPPortIfAvailable(t *testing.T, network, address string) (int, bool) {
+	t.Helper()
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		return 0, false
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	_, portRaw, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address %q: %v", ln.Addr().String(), err)
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil {
+		t.Fatalf("parse listener port %q: %v", portRaw, err)
+	}
+	return port, true
+}
+
+func unusedTCPPort(t *testing.T, network, address string) int {
+	t.Helper()
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		t.Fatalf("listen %s %s: %v", network, address, err)
+	}
+	_, portRaw, err := net.SplitHostPort(ln.Addr().String())
+	if closeErr := ln.Close(); closeErr != nil {
+		t.Fatalf("close listener: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("split listener address %q: %v", ln.Addr().String(), err)
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil {
+		t.Fatalf("parse listener port %q: %v", portRaw, err)
+	}
+	return port
 }
