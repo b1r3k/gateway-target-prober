@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -48,6 +50,7 @@ func init() {
 type Config struct {
 	GatewayName         string
 	GatewayNamespace    string
+	Target              TargetRef
 	AnnotationKey       string
 	IPs                 []string
 	HostHeader          string
@@ -55,9 +58,36 @@ type Config struct {
 	Timeout             time.Duration
 	HTTPPath            string
 	HTTPScheme          string
+	ProbeMode           ProbeMode
 	TCPPorts            []int
 	InsecureSkipVerify  bool
 	PrintVersionAndExit bool
+}
+
+type ProbeMode string
+
+const (
+	ProbeModeHTTP ProbeMode = "http"
+	ProbeModeTCP  ProbeMode = "tcp"
+)
+
+type TargetKind string
+
+const (
+	TargetKindGateway     TargetKind = "gateway"
+	TargetKindListenerSet TargetKind = "listenerset"
+)
+
+type TargetRef struct {
+	Kind      TargetKind
+	Name      string
+	Namespace string
+}
+
+var listenerSetGVK = schema.GroupVersionKind{
+	Group:   "gateway.networking.k8s.io",
+	Version: "v1",
+	Kind:    "ListenerSet",
 }
 
 // loadConfig parses the given args and env vars into a Config. It uses a
@@ -69,13 +99,17 @@ func loadConfig(args []string) (Config, error) {
 	fs.StringVar(&c.GatewayName, "gateway-name", getStr("GATEWAY_NAME", ""), "Gateway resource name to patch")
 	fs.StringVar(&c.GatewayNamespace, "gateway-namespace", getStr("GATEWAY_NAMESPACE", ""), "Namespace of the Gateway resource")
 	fs.StringVar(&c.AnnotationKey, "annotation-key", getStr("ANNOTATION_KEY", "external-dns.alpha.kubernetes.io/target"), "Annotation key to patch")
+	targetKindRaw := fs.String("target-kind", getStr("TARGET_KIND", ""), "Target resource kind: gateway or listenerset")
+	targetNameRaw := fs.String("target-name", getStr("TARGET_NAME", ""), "Target resource name to patch")
+	targetNamespaceRaw := fs.String("target-namespace", getStr("TARGET_NAMESPACE", ""), "Namespace of the target resource")
 	ipsRaw := fs.String("ips", getStr("IPS", ""), "Comma-separated IPs to probe")
 	fs.StringVar(&c.HostHeader, "host-header", getStr("HOST_HEADER", ""), "HTTP Host header for probes")
 	fs.DurationVar(&c.Interval, "interval", getDuration("INTERVAL", 30*time.Second), "Probe interval")
 	fs.DurationVar(&c.Timeout, "timeout", getDuration("TIMEOUT", 2*time.Second), "Per-probe timeout")
 	fs.StringVar(&c.HTTPPath, "http-path", getStr("HTTP_PATH", "/"), "HTTP path to probe")
 	fs.StringVar(&c.HTTPScheme, "http-scheme", getStr("HTTP_SCHEME", "http"), "http or https")
-	tcpPortsRaw := fs.String("tcp-ports", getStr("TCP_PORTS", ""), "Comma-separated TCP ports to require after HTTP(S) probe")
+	probeModeRaw := fs.String("probe-mode", getStr("PROBE_MODE", string(ProbeModeHTTP)), "Probe mode: http or tcp")
+	tcpPortsRaw := fs.String("tcp-ports", getStr("TCP_PORTS", ""), "Comma-separated TCP ports for tcp probe mode")
 	fs.BoolVar(&c.InsecureSkipVerify, "insecure-skip-verify", getBool("INSECURE_SKIP_VERIFY", false), "skip TLS verification")
 	fs.BoolVar(&c.PrintVersionAndExit, "version", false, "print version and exit")
 
@@ -88,12 +122,6 @@ func loadConfig(args []string) (Config, error) {
 		return c, nil
 	}
 
-	if c.GatewayName == "" {
-		return c, errors.New("--gateway-name (or GATEWAY_NAME) is required")
-	}
-	if c.GatewayNamespace == "" {
-		return c, errors.New("--gateway-namespace (or GATEWAY_NAMESPACE) is required")
-	}
 	if *ipsRaw == "" {
 		return c, errors.New("--ips (or IPS) is required")
 	}
@@ -101,24 +129,104 @@ func loadConfig(args []string) (Config, error) {
 	if len(c.IPs) == 0 {
 		return c, errors.New("--ips (or IPS) is required")
 	}
+
+	probeMode, err := parseProbeMode(*probeModeRaw)
+	if err != nil {
+		return c, err
+	}
+	c.ProbeMode = probeMode
+
 	tcpPorts, err := parseTCPPorts(*tcpPortsRaw)
 	if err != nil {
 		return c, err
 	}
+	if c.ProbeMode == ProbeModeHTTP && len(tcpPorts) > 0 {
+		return c, errors.New("--tcp-ports requires --probe-mode=tcp; combined HTTP/S+TCP checks are not supported")
+	}
+	if c.ProbeMode == ProbeModeTCP && len(tcpPorts) == 0 {
+		return c, errors.New("--tcp-ports is required when --probe-mode=tcp")
+	}
 	c.TCPPorts = tcpPorts
+
+	target, err := resolveTargetRef(c.GatewayName, c.GatewayNamespace, *targetKindRaw, *targetNameRaw, *targetNamespaceRaw)
+	if err != nil {
+		return c, err
+	}
+	c.Target = target
 	return c, nil
+}
+
+func parseProbeMode(raw string) (ProbeMode, error) {
+	switch ProbeMode(strings.ToLower(strings.TrimSpace(raw))) {
+	case ProbeModeHTTP:
+		return ProbeModeHTTP, nil
+	case ProbeModeTCP:
+		return ProbeModeTCP, nil
+	default:
+		return "", fmt.Errorf("invalid probe mode %q", raw)
+	}
+}
+
+func parseTargetKind(raw string) (TargetKind, error) {
+	if strings.TrimSpace(raw) == "" {
+		return TargetKindGateway, nil
+	}
+	switch TargetKind(strings.ToLower(strings.TrimSpace(raw))) {
+	case TargetKindGateway:
+		return TargetKindGateway, nil
+	case TargetKindListenerSet:
+		return TargetKindListenerSet, nil
+	default:
+		return "", fmt.Errorf("invalid target kind %q", raw)
+	}
+}
+
+func resolveTargetRef(gatewayName, gatewayNamespace, targetKindRaw, targetNameRaw, targetNamespaceRaw string) (TargetRef, error) {
+	kind, err := parseTargetKind(targetKindRaw)
+	if err != nil {
+		return TargetRef{}, err
+	}
+
+	name := strings.TrimSpace(targetNameRaw)
+	namespace := strings.TrimSpace(targetNamespaceRaw)
+
+	if kind == TargetKindGateway {
+		if name == "" {
+			name = gatewayName
+		}
+		if namespace == "" {
+			namespace = gatewayNamespace
+		}
+		if name == "" {
+			return TargetRef{}, errors.New("--target-name or --gateway-name (or TARGET_NAME/GATEWAY_NAME) is required")
+		}
+		if namespace == "" {
+			return TargetRef{}, errors.New("--target-namespace or --gateway-namespace (or TARGET_NAMESPACE/GATEWAY_NAMESPACE) is required")
+		}
+		return TargetRef{Kind: kind, Name: name, Namespace: namespace}, nil
+	}
+
+	if name == "" {
+		return TargetRef{}, errors.New("--target-name (or TARGET_NAME) is required when --target-kind=listenerset")
+	}
+	if namespace == "" {
+		return TargetRef{}, errors.New("--target-namespace (or TARGET_NAMESPACE) is required when --target-kind=listenerset")
+	}
+	return TargetRef{Kind: kind, Name: name, Namespace: namespace}, nil
 }
 
 type Runner struct {
 	k8s              client.Client
 	gatewayName      string
 	gatewayNamespace string
+	target           TargetRef
 	annotationKey    string
 	ips              []string
 	httpClient       *http.Client
 	urlScheme        string
 	httpPath         string
 	hostHeader       string
+	probeMode        ProbeMode
 	tcpPorts         []int
 	interval         time.Duration
 	timeout          time.Duration
@@ -145,6 +253,15 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 func (r *Runner) HealthyIPs(ctx context.Context) ([]string, error) {
+	switch r.currentProbeMode() {
+	case ProbeModeTCP:
+		return r.healthyTCPIPs(ctx)
+	default:
+		return r.healthyHTTPIPs(ctx)
+	}
+}
+
+func (r *Runner) healthyHTTPIPs(ctx context.Context) ([]string, error) {
 	logger := log.FromContext(ctx)
 	healthy := make([]string, 0, len(r.ips))
 	for _, ip := range r.ips {
@@ -188,14 +305,28 @@ func (r *Runner) HealthyIPs(ctx context.Context) ([]string, error) {
 		_ = resp.Body.Close()
 		logger.Info("HTTP response received", "ip", ip, "url", u, "status_code", resp.StatusCode)
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			if !r.tcpPortsHealthy(ctx, ip) {
-				continue
-			}
 			healthy = append(healthy, ip)
 			logger.Info("IP marked as healthy", "ip", ip)
 		} else {
 			logger.Info("IP marked as unhealthy due to status code", "ip", ip, "status_code", resp.StatusCode)
 		}
+	}
+	if len(healthy) == 0 {
+		return nil, fmt.Errorf("no healthy IP found")
+	}
+	return healthy, nil
+}
+
+func (r *Runner) healthyTCPIPs(ctx context.Context) ([]string, error) {
+	logger := log.FromContext(ctx)
+	healthy := make([]string, 0, len(r.ips))
+	for _, ip := range r.ips {
+		logger.Info("probing TCP ports", "ip", ip, "ports", intsToCSV(r.tcpPorts))
+		if !r.tcpPortsHealthy(ctx, ip) {
+			continue
+		}
+		healthy = append(healthy, ip)
+		logger.Info("IP marked as healthy", "ip", ip)
 	}
 	if len(healthy) == 0 {
 		return nil, fmt.Errorf("no healthy IP found")
@@ -218,6 +349,13 @@ func (r *Runner) tcpPortsHealthy(ctx context.Context, ip string) bool {
 		logger.Info("tcp probe succeeded", "ip", ip, "port", port)
 	}
 	return true
+}
+
+func (r *Runner) currentProbeMode() ProbeMode {
+	if r.probeMode == "" {
+		return ProbeModeHTTP
+	}
+	return r.probeMode
 }
 
 func (r *Runner) probeTimeout() time.Duration {
@@ -248,26 +386,66 @@ func (r *Runner) tick(ctx context.Context) {
 		return
 	}
 	if err := r.applyHealthy(ctx, healthy); err != nil {
-		logger.Error(err, "failed to patch gateway annotation")
+		logger.Error(err, "failed to patch target annotation")
 	}
 }
 
 func (r *Runner) applyHealthy(ctx context.Context, healthy []string) error {
 	desired := strings.Join(healthy, ",")
-	gw := &gwv1.Gateway{}
-	key := client.ObjectKey{Name: r.gatewayName, Namespace: r.gatewayNamespace}
-	if err := r.k8s.Get(ctx, key, gw); err != nil {
-		return fmt.Errorf("get gateway: %w", err)
+	target := r.currentTarget()
+	key := client.ObjectKey{Name: target.Name, Namespace: target.Namespace}
+
+	switch target.Kind {
+	case TargetKindGateway:
+		gw := &gwv1.Gateway{}
+		if err := r.k8s.Get(ctx, key, gw); err != nil {
+			return fmt.Errorf("get gateway %s/%s: %w", target.Namespace, target.Name, err)
+		}
+		return patchAnnotation(ctx, r.k8s, gw, r.annotationKey, desired)
+	case TargetKindListenerSet:
+		ls := &unstructured.Unstructured{}
+		ls.SetGroupVersionKind(listenerSetGVK)
+		if err := r.k8s.Get(ctx, key, ls); err != nil {
+			return fmt.Errorf("get listenerset %s/%s: %w", target.Namespace, target.Name, err)
+		}
+		return patchAnnotation(ctx, r.k8s, ls, r.annotationKey, desired)
+	default:
+		return fmt.Errorf("unsupported target kind %q", target.Kind)
 	}
-	if normalizeIPList(gw.Annotations[r.annotationKey]) == normalizeIPList(desired) {
+}
+
+func (r *Runner) currentTarget() TargetRef {
+	if r.target.Kind != "" {
+		return r.target
+	}
+	return TargetRef{
+		Kind:      TargetKindGateway,
+		Name:      r.gatewayName,
+		Namespace: r.gatewayNamespace,
+	}
+}
+
+func patchAnnotation(ctx context.Context, k8s client.Client, obj client.Object, key, desired string) error {
+	if normalizeIPList(obj.GetAnnotations()[key]) == normalizeIPList(desired) {
 		return nil
 	}
-	patch := client.MergeFrom(gw.DeepCopy())
-	if gw.Annotations == nil {
-		gw.Annotations = map[string]string{}
+	before, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("copy object %T", obj)
 	}
-	gw.Annotations[r.annotationKey] = desired
-	return r.k8s.Patch(ctx, gw, patch)
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	} else {
+		copied := make(map[string]string, len(annotations)+1)
+		for k, v := range annotations {
+			copied[k] = v
+		}
+		annotations = copied
+	}
+	annotations[key] = desired
+	obj.SetAnnotations(annotations)
+	return k8s.Patch(ctx, obj, client.MergeFrom(before))
 }
 
 func parseEnvOrFlag(name string, fallback *string) string {
@@ -326,12 +504,14 @@ func main() {
 		k8s:              mgr.GetClient(),
 		gatewayName:      cfg.GatewayName,
 		gatewayNamespace: cfg.GatewayNamespace,
+		target:           cfg.Target,
 		annotationKey:    cfg.AnnotationKey,
 		ips:              cfg.IPs,
 		httpClient:       httpClient,
 		urlScheme:        cfg.HTTPScheme,
 		httpPath:         cfg.HTTPPath,
 		hostHeader:       cfg.HostHeader,
+		probeMode:        cfg.ProbeMode,
 		tcpPorts:         cfg.TCPPorts,
 		interval:         cfg.Interval,
 		timeout:          cfg.Timeout,
@@ -357,8 +537,12 @@ func main() {
 		"build_date", date,
 		"gateway_name", cfg.GatewayName,
 		"gateway_namespace", cfg.GatewayNamespace,
+		"target_kind", cfg.Target.Kind,
+		"target_name", cfg.Target.Name,
+		"target_namespace", cfg.Target.Namespace,
 		"annotation", r.annotationKey,
 		"ips", strings.Join(cfg.IPs, ","),
+		"probe_mode", cfg.ProbeMode,
 		"path", cfg.HTTPPath,
 		"interval", r.interval.String(),
 		"scheme", cfg.HTTPScheme,

@@ -13,7 +13,9 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -295,49 +297,39 @@ func TestRunner_HealthyIPs_NoTCPPortsUsesHTTPOnly(t *testing.T) {
 	}
 }
 
-func TestRunner_HealthyIPs_WithTCPPorts(t *testing.T) {
+func TestRunner_HealthyIPs_TCPMode(t *testing.T) {
 	openPort := listenTCPPort(t, "tcp4", "127.0.0.1:0")
 	closedPort := unusedTCPPort(t, "tcp4", "127.0.0.1:0")
 
 	tests := []struct {
 		name            string
-		statusByIP      map[string]int
 		tcpPorts        []int
 		expectedHealthy []string
 		expectError     bool
 	}{
 		{
-			name:            "HTTP healthy and all TCP ports reachable",
-			statusByIP:      map[string]int{"127.0.0.1": 200},
+			name:            "all TCP ports reachable",
 			tcpPorts:        []int{openPort},
 			expectedHealthy: []string{"127.0.0.1"},
 		},
 		{
-			name:            "HTTP healthy but one TCP port unreachable",
-			statusByIP:      map[string]int{"127.0.0.1": 200},
+			name:            "one TCP port unreachable",
 			tcpPorts:        []int{openPort, closedPort},
 			expectedHealthy: nil,
 			expectError:     true,
 		},
 		{
-			name:            "HTTP unhealthy even when TCP port reachable",
-			statusByIP:      map[string]int{"127.0.0.1": 503},
-			tcpPorts:        []int{openPort},
-			expectedHealthy: nil,
-			expectError:     true,
+			name:            "multiple TCP ports reachable",
+			tcpPorts:        []int{openPort, openPort},
+			expectedHealthy: []string{"127.0.0.1"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := &Runner{
-				ips: []string{"127.0.0.1"},
-				httpClient: &http.Client{
-					Transport: fakeStatusTransport{statusByIP: tt.statusByIP},
-					Timeout:   100 * time.Millisecond,
-				},
-				urlScheme: "http",
-				httpPath:  "/",
+				ips:       []string{"127.0.0.1"},
+				probeMode: ProbeModeTCP,
 				timeout:   100 * time.Millisecond,
 				tcpPorts:  tt.tcpPorts,
 			}
@@ -363,13 +355,8 @@ func TestRunner_HealthyIPs_TCPPortsIPv6(t *testing.T) {
 	}
 
 	runner := &Runner{
-		ips: []string{"::1"},
-		httpClient: &http.Client{
-			Transport: fakeStatusTransport{statusByIP: map[string]int{"::1": 200}},
-			Timeout:   100 * time.Millisecond,
-		},
-		urlScheme: "http",
-		httpPath:  "/",
+		ips:       []string{"::1"},
+		probeMode: ProbeModeTCP,
 		timeout:   100 * time.Millisecond,
 		tcpPorts:  []int{openPort},
 	}
@@ -380,6 +367,27 @@ func TestRunner_HealthyIPs_TCPPortsIPv6(t *testing.T) {
 	}
 	if !equalStrings(healthyIPs, []string{"::1"}) {
 		t.Errorf("healthy IPs = %#v, want %#v", healthyIPs, []string{"::1"})
+	}
+}
+
+func TestRunner_HealthyIPs_TCPModeUnreachableAddress(t *testing.T) {
+	runner := &Runner{
+		ips:       []string{"192.0.2.1"},
+		probeMode: ProbeModeTCP,
+		timeout:   50 * time.Millisecond,
+		tcpPorts:  []int{25},
+	}
+
+	started := time.Now()
+	healthyIPs, err := runner.HealthyIPs(context.Background())
+	if err == nil {
+		t.Fatal("expected unreachable address to be unhealthy")
+	}
+	if len(healthyIPs) != 0 {
+		t.Errorf("healthy IPs = %#v, want empty", healthyIPs)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("TCP probe took %s, expected timeout to keep it under 1s", elapsed)
 	}
 }
 
@@ -423,6 +431,15 @@ func TestConfig_GatewayMode(t *testing.T) {
 	if len(cfg.IPs) != 2 {
 		t.Errorf("IPs len = %d, want 2", len(cfg.IPs))
 	}
+	if cfg.ProbeMode != ProbeModeHTTP {
+		t.Errorf("ProbeMode = %q, want %q", cfg.ProbeMode, ProbeModeHTTP)
+	}
+	if cfg.Target.Kind != TargetKindGateway {
+		t.Errorf("Target.Kind = %q, want %q", cfg.Target.Kind, TargetKindGateway)
+	}
+	if cfg.Target.Name != "public-edge" || cfg.Target.Namespace != "public-ingress-nginx" {
+		t.Errorf("Target = %#v, want public-edge/public-ingress-nginx", cfg.Target)
+	}
 }
 
 func TestConfig_TCPPorts(t *testing.T) {
@@ -438,23 +455,24 @@ func TestConfig_TCPPorts(t *testing.T) {
 		},
 		{
 			name:      "flag parses comma-separated ports",
-			args:      []string{"--tcp-ports=993,587,25"},
+			args:      []string{"--probe-mode=tcp", "--tcp-ports=993,587,25"},
 			wantPorts: []int{993, 587, 25},
 		},
 		{
 			name:      "environment variable parses comma-separated ports",
 			env:       "993,587",
+			args:      []string{"--probe-mode=tcp"},
 			wantPorts: []int{993, 587},
 		},
 		{
 			name:      "whitespace and empty entries are ignored",
-			args:      []string{"--tcp-ports= 993, , 587 ,25 "},
+			args:      []string{"--probe-mode=tcp", "--tcp-ports= 993, , 587 ,25 "},
 			wantPorts: []int{993, 587, 25},
 		},
 		{
 			name:      "flag overrides environment variable",
 			env:       "25",
-			args:      []string{"--tcp-ports=993"},
+			args:      []string{"--probe-mode=tcp", "--tcp-ports=993"},
 			wantPorts: []int{993},
 		},
 	}
@@ -474,6 +492,102 @@ func TestConfig_TCPPorts(t *testing.T) {
 			}
 			if !equalInts(cfg.TCPPorts, tt.wantPorts) {
 				t.Errorf("TCPPorts = %#v, want %#v", cfg.TCPPorts, tt.wantPorts)
+			}
+			if len(tt.wantPorts) > 0 && cfg.ProbeMode != ProbeModeTCP {
+				t.Errorf("ProbeMode = %q, want %q", cfg.ProbeMode, ProbeModeTCP)
+			}
+		})
+	}
+}
+
+func TestConfig_TCPPortsRequireTCPMode(t *testing.T) {
+	t.Setenv("GATEWAY_NAME", "public-edge")
+	t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
+	t.Setenv("IPS", "1.1.1.1")
+
+	if _, err := loadConfig([]string{"--tcp-ports=25"}); err == nil {
+		t.Fatal("expected --tcp-ports without --probe-mode=tcp to fail")
+	}
+}
+
+func TestConfig_TCPModeRequiresPorts(t *testing.T) {
+	t.Setenv("GATEWAY_NAME", "public-edge")
+	t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
+	t.Setenv("IPS", "1.1.1.1")
+
+	if _, err := loadConfig([]string{"--probe-mode=tcp"}); err == nil {
+		t.Fatal("expected --probe-mode=tcp without --tcp-ports to fail")
+	}
+}
+
+func TestConfig_ProbeModeInvalid(t *testing.T) {
+	t.Setenv("GATEWAY_NAME", "public-edge")
+	t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
+	t.Setenv("IPS", "1.1.1.1")
+
+	if _, err := loadConfig([]string{"--probe-mode=smtp"}); err == nil {
+		t.Fatal("expected invalid probe mode to fail")
+	}
+}
+
+func TestConfig_ListenerSetTarget(t *testing.T) {
+	t.Setenv("IPS", "1.1.1.1")
+
+	cfg, err := loadConfig([]string{
+		"--target-kind=listenerset",
+		"--target-name=smtp-edge",
+		"--target-namespace=public-ingress-nginx",
+		"--probe-mode=tcp",
+		"--tcp-ports=25",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Target.Kind != TargetKindListenerSet {
+		t.Errorf("Target.Kind = %q, want %q", cfg.Target.Kind, TargetKindListenerSet)
+	}
+	if cfg.Target.Name != "smtp-edge" || cfg.Target.Namespace != "public-ingress-nginx" {
+		t.Errorf("Target = %#v, want smtp-edge/public-ingress-nginx", cfg.Target)
+	}
+}
+
+func TestConfig_ListenerSetTargetRequiresNameAndNamespace(t *testing.T) {
+	t.Setenv("IPS", "1.1.1.1")
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "missing name",
+			args: []string{
+				"--target-kind=listenerset",
+				"--target-namespace=public-ingress-nginx",
+				"--probe-mode=tcp",
+				"--tcp-ports=25",
+			},
+		},
+		{
+			name: "missing namespace",
+			args: []string{
+				"--target-kind=listenerset",
+				"--target-name=smtp-edge",
+				"--probe-mode=tcp",
+				"--tcp-ports=25",
+			},
+		},
+		{
+			name: "invalid target kind",
+			args: []string{
+				"--target-kind=service",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := loadConfig(tt.args); err == nil {
+				t.Fatal("expected ListenerSet target config to fail")
 			}
 		})
 	}
@@ -496,7 +610,7 @@ func TestConfig_TCPPortsInvalid(t *testing.T) {
 			t.Setenv("GATEWAY_NAMESPACE", "public-ingress-nginx")
 			t.Setenv("IPS", "1.1.1.1")
 
-			if _, err := loadConfig([]string{"--tcp-ports=" + tt.raw}); err == nil {
+			if _, err := loadConfig([]string{"--probe-mode=tcp", "--tcp-ports=" + tt.raw}); err == nil {
 				t.Fatal("expected error for invalid TCP ports, got nil")
 			}
 		})
@@ -530,6 +644,7 @@ func TestRunner_PatchesGatewayAnnotation(t *testing.T) {
 		k8s:              k8s,
 		gatewayName:      "public-edge",
 		gatewayNamespace: "public-ingress-nginx",
+		target:           TargetRef{Kind: TargetKindGateway, Name: "public-edge", Namespace: "public-ingress-nginx"},
 		annotationKey:    "external-dns.alpha.kubernetes.io/target",
 	}
 
@@ -547,6 +662,98 @@ func TestRunner_PatchesGatewayAnnotation(t *testing.T) {
 	}
 }
 
+func TestRunner_PatchesListenerSetAnnotation(t *testing.T) {
+	ls := newListenerSet("smtp-edge", "public-ingress-nginx", map[string]string{
+		"external-dns.alpha.kubernetes.io/target": "1.1.1.1,2.2.2.2,3.3.3.3",
+	})
+	k8s := fake.NewClientBuilder().WithObjects(ls).Build()
+
+	r := &Runner{
+		k8s:           k8s,
+		target:        TargetRef{Kind: TargetKindListenerSet, Name: "smtp-edge", Namespace: "public-ingress-nginx"},
+		annotationKey: "external-dns.alpha.kubernetes.io/target",
+	}
+
+	if err := r.applyHealthy(context.Background(), []string{"1.1.1.1", "3.3.3.3"}); err != nil {
+		t.Fatalf("applyHealthy: %v", err)
+	}
+
+	got := newListenerSet("smtp-edge", "public-ingress-nginx", nil)
+	if err := k8s.Get(context.Background(), client.ObjectKey{Name: "smtp-edge", Namespace: "public-ingress-nginx"}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	want := "1.1.1.1,3.3.3.3"
+	if got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"] != want {
+		t.Errorf("annotation = %q, want %q", got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"], want)
+	}
+}
+
+func TestRunner_PatchesListenerSetAnnotationInitializesNilAnnotations(t *testing.T) {
+	ls := newListenerSet("smtp-edge", "public-ingress-nginx", nil)
+	k8s := fake.NewClientBuilder().WithObjects(ls).Build()
+
+	r := &Runner{
+		k8s:           k8s,
+		target:        TargetRef{Kind: TargetKindListenerSet, Name: "smtp-edge", Namespace: "public-ingress-nginx"},
+		annotationKey: "external-dns.alpha.kubernetes.io/target",
+	}
+
+	if err := r.applyHealthy(context.Background(), []string{"1.1.1.1"}); err != nil {
+		t.Fatalf("applyHealthy: %v", err)
+	}
+
+	got := newListenerSet("smtp-edge", "public-ingress-nginx", nil)
+	if err := k8s.Get(context.Background(), client.ObjectKey{Name: "smtp-edge", Namespace: "public-ingress-nginx"}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"] != "1.1.1.1" {
+		t.Errorf("annotation = %q, want 1.1.1.1", got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"])
+	}
+}
+
+func TestRunner_NoopWhenListenerSetAnnotationAlreadyCorrect(t *testing.T) {
+	const original = "2.2.2.2,1.1.1.1"
+	ls := newListenerSet("smtp-edge", "public-ingress-nginx", map[string]string{
+		"external-dns.alpha.kubernetes.io/target": original,
+	})
+	k8s := fake.NewClientBuilder().WithObjects(ls).Build()
+
+	r := &Runner{
+		k8s:           k8s,
+		target:        TargetRef{Kind: TargetKindListenerSet, Name: "smtp-edge", Namespace: "public-ingress-nginx"},
+		annotationKey: "external-dns.alpha.kubernetes.io/target",
+	}
+
+	if err := r.applyHealthy(context.Background(), []string{"1.1.1.1", "2.2.2.2"}); err != nil {
+		t.Fatalf("applyHealthy: %v", err)
+	}
+
+	got := newListenerSet("smtp-edge", "public-ingress-nginx", nil)
+	if err := k8s.Get(context.Background(), client.ObjectKey{Name: "smtp-edge", Namespace: "public-ingress-nginx"}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"] != original {
+		t.Errorf("annotation = %q, want original %q", got.GetAnnotations()["external-dns.alpha.kubernetes.io/target"], original)
+	}
+}
+
+func TestRunner_MissingListenerSetTargetReturnsError(t *testing.T) {
+	k8s := fake.NewClientBuilder().Build()
+	r := &Runner{
+		k8s:           k8s,
+		target:        TargetRef{Kind: TargetKindListenerSet, Name: "smtp-edge", Namespace: "public-ingress-nginx"},
+		annotationKey: "external-dns.alpha.kubernetes.io/target",
+	}
+
+	err := r.applyHealthy(context.Background(), []string{"1.1.1.1"})
+	if err == nil {
+		t.Fatal("expected missing ListenerSet target to fail")
+	}
+	if !strings.Contains(err.Error(), "get listenerset public-ingress-nginx/smtp-edge") {
+		t.Fatalf("error = %q, want ListenerSet context", err.Error())
+	}
+}
+
 func TestRunner_RefusesToPatchWhenAllUnhealthy(t *testing.T) {
 	gw := &gwv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -558,7 +765,7 @@ func TestRunner_RefusesToPatchWhenAllUnhealthy(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = gwv1.Install(scheme)
 	k8s := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
-	r := &Runner{k8s: k8s, gatewayName: "public-edge", gatewayNamespace: "public-ingress-nginx", annotationKey: "external-dns.alpha.kubernetes.io/target"}
+	r := &Runner{k8s: k8s, gatewayName: "public-edge", gatewayNamespace: "public-ingress-nginx", target: TargetRef{Kind: TargetKindGateway, Name: "public-edge", Namespace: "public-ingress-nginx"}, annotationKey: "external-dns.alpha.kubernetes.io/target"}
 
 	// r.ips is empty → HealthyIPs returns []; tick should refuse to patch.
 	r.tick(context.Background())
@@ -589,6 +796,7 @@ func TestRunner_NoopWhenAnnotationAlreadyCorrect(t *testing.T) {
 		k8s:              k8s,
 		gatewayName:      "public-edge",
 		gatewayNamespace: "public-ingress-nginx",
+		target:           TargetRef{Kind: TargetKindGateway, Name: "public-edge", Namespace: "public-ingress-nginx"},
 		annotationKey:    "external-dns.alpha.kubernetes.io/target",
 	}
 	if err := r.applyHealthy(context.Background(), []string{"1.1.1.1", "2.2.2.2"}); err != nil {
@@ -698,4 +906,17 @@ func unusedTCPPort(t *testing.T, network, address string) int {
 		t.Fatalf("parse listener port %q: %v", portRaw, err)
 	}
 	return port
+}
+
+func newListenerSet(name, namespace string, annotations map[string]string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
+		Kind:    "ListenerSet",
+	})
+	obj.SetName(name)
+	obj.SetNamespace(namespace)
+	obj.SetAnnotations(annotations)
+	return obj
 }

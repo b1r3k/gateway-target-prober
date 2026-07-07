@@ -4,7 +4,7 @@ metadata:
   name: gateway-target-prober
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways"]
+  resources: ["gateways", "listenersets"]
   verbs: ["get", "list", "watch", "patch", "update"]
 - apiGroups: [""]
   resources: ["events"]
